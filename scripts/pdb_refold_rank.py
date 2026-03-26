@@ -193,7 +193,10 @@ def extract_chain_sequence(structure, chain_id: str) -> str:
 
 
 def write_fasta_for_boltz(target_seq: str, binder_seq: str, out_fa: Path) -> None:
-    out_fa.write_text(f">target|protein\n{target_seq}\n>binder|protein\n{binder_seq}\n")
+    # Boltz FASTA headers use the first field as the chain ID. Keep IDs short
+    # and stable because downstream Boltz metadata stores chain names in a
+    # fixed-width field; descriptive IDs like "target" can be truncated.
+    out_fa.write_text(f">A|protein\n{target_seq}\n>B|protein\n{binder_seq}\n")
 
 
 def run_boltz_predict(
@@ -254,7 +257,11 @@ def _safe_get(d: dict, key: str, default=np.nan):
 def choose_best_sample_and_metrics(boltz_out_dir: Path) -> Tuple[Path, Path, Dict[str, float]]:
     confs = _list_confidence_jsons(boltz_out_dir)
     if not confs:
-        raise FileNotFoundError(f"No confidence JSON found under {boltz_out_dir}")
+        msg = f"No confidence JSON found under {boltz_out_dir}"
+        processed_inputs = sorted(boltz_out_dir.rglob("processed/*"))
+        if processed_inputs:
+            msg += f". Processed inputs present: {[p.name for p in processed_inputs]}"
+        raise FileNotFoundError(msg)
 
     best_score = -math.inf
     best_payload = None
