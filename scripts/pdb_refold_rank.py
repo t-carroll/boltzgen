@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sampling_steps", type=int, default=200)
     p.add_argument("--diffusion_samples", type=int, default=5)
     p.add_argument("--recycling_steps", type=int, default=3)
+    p.add_argument(
+        "--boltz_cache_dir",
+        default=None,
+        help="Cache directory passed to `boltz predict --cache`. Defaults to `<workdir>/boltz_cache`.",
+    )
+    p.add_argument(
+        "--use_msa_server",
+        action="store_true",
+        help="Pass `--use_msa_server` through to `boltz predict` when MSA generation is required.",
+    )
     p.add_argument("--keep_intermediates", action="store_true")
     p.add_argument(
         "--validate_only",
@@ -194,27 +205,38 @@ def run_boltz_predict(
     sampling_steps: int,
     diffusion_samples: int,
     recycling_steps: int,
+    use_msa_server: bool,
+    cache_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         boltz_binary,
         "predict",
         str(fasta_path),
         "--out_dir",
         str(output_dir),
+        "--cache",
+        str(cache_dir),
         "--sampling_steps",
         str(sampling_steps),
         "--diffusion_samples",
         str(diffusion_samples),
         "--recycling_steps",
         str(recycling_steps),
-        "--use_msa_server",
-        "False",
     ]
+    if use_msa_server:
+        cmd.append("--use_msa_server")
     if accelerator != "auto":
         cmd.extend(["--accelerator", accelerator])
     cmd.extend(extra_args)
-    subprocess.check_call(cmd)
+    cache_root = output_dir / ".runtime_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.setdefault("MPLCONFIGDIR", str(cache_root / "matplotlib"))
+    env.setdefault("XDG_CACHE_HOME", str(cache_root / "xdg"))
+    env.setdefault("NUMBA_CACHE_DIR", str(cache_root / "numba"))
+    subprocess.check_call(cmd, env=env)
 
 
 def _list_confidence_jsons(root: Path) -> List[Path]:
@@ -429,6 +451,8 @@ def process_entry(
     sampling_steps: int,
     diffusion_samples: int,
     recycling_steps: int,
+    use_msa_server: bool,
+    boltz_cache_dir: Path,
 ) -> RefoldResult:
     pdb_path = download_pdb(entry.pdb_id, pdb_dir)
     structure = parse_structure(pdb_path)
@@ -453,6 +477,8 @@ def process_entry(
         sampling_steps=sampling_steps,
         diffusion_samples=diffusion_samples,
         recycling_steps=recycling_steps,
+        use_msa_server=use_msa_server,
+        cache_dir=boltz_cache_dir,
     )
 
     refold_cif, confidence_json, conf = choose_best_sample_and_metrics(boltz_out)
@@ -500,6 +526,7 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     pdb_dir = Path(args.pdb_dir) if args.pdb_dir else workdir / "pdb_cache"
+    boltz_cache_dir = Path(args.boltz_cache_dir) if args.boltz_cache_dir else workdir / "boltz_cache"
     boltz_binary_path = shutil.which(args.boltz_binary) if not Path(args.boltz_binary).exists() else args.boltz_binary
     if not args.validate_only and boltz_binary_path is None:
         raise RuntimeError(
@@ -532,12 +559,14 @@ def main() -> None:
                     entry=e,
                     pdb_dir=pdb_dir,
                     workdir=workdir,
-                    boltz_binary=args.boltz_binary,
+                    boltz_binary=boltz_binary_path,
                     boltz_predict_extra_args=args.boltz_predict_extra_args,
                     accelerator=args.accelerator,
                     sampling_steps=args.sampling_steps,
                     diffusion_samples=args.diffusion_samples,
                     recycling_steps=args.recycling_steps,
+                    use_msa_server=args.use_msa_server,
+                    boltz_cache_dir=boltz_cache_dir,
                 )
                 rows.append(
                     {
