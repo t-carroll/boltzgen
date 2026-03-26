@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -102,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion_samples", type=int, default=5)
     p.add_argument("--recycling_steps", type=int, default=3)
     p.add_argument("--keep_intermediates", action="store_true")
+    p.add_argument(
+        "--validate_only",
+        action="store_true",
+        help="Only download/parse PDB files and validate chain IDs without running `boltz predict`.",
+    )
     return p.parse_args()
 
 
@@ -122,10 +128,24 @@ def download_pdb(pdb_id: str, out_dir: Path) -> Path:
     out = out_dir / f"{pdb_id}.pdb"
     if out.exists():
         return out
-    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
     import urllib.request
 
-    urllib.request.urlretrieve(url, out)
+    urls = [
+        f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb",
+        f"https://models.rcsb.org/{pdb_id.lower()}.pdb",
+    ]
+    last_exc = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "boltzgen-pdb-refold-rank/1.0"})
+            with urllib.request.urlopen(req) as r:
+                out.write_bytes(r.read())
+            if out.stat().st_size == 0:
+                raise ValueError(f"Downloaded empty file from {url}")
+            return out
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"Failed to download {pdb_id} from known endpoints: {last_exc}")
     return out
 
 
@@ -138,12 +158,15 @@ def parse_structure(pdb_path: Path):
 
 def extract_chain_sequence(structure, chain_id: str) -> str:
     chain = None
+    available_chain_ids = []
+    search_ids = [chain_id, chain_id.upper(), chain_id.lower()]
     for model in structure:
-        chain = model[chain_id] if chain_id in model else None
+        available_chain_ids = [c.id for c in model]
+        chain = next((model[cid] for cid in search_ids if cid in model), None)
         if chain is not None:
             break
     if chain is None:
-        raise ValueError(f"Chain {chain_id} not found")
+        raise ValueError(f"Chain {chain_id} not found. Available chains: {available_chain_ids}")
 
     seq = []
     seen = set()
@@ -477,48 +500,71 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     pdb_dir = Path(args.pdb_dir) if args.pdb_dir else workdir / "pdb_cache"
+    boltz_binary_path = shutil.which(args.boltz_binary) if not Path(args.boltz_binary).exists() else args.boltz_binary
+    if not args.validate_only and boltz_binary_path is None:
+        raise RuntimeError(
+            f"Could not find Boltz binary '{args.boltz_binary}' on PATH. "
+            "Install Boltz or pass --boltz_binary /full/path/to/boltz. "
+            "You can run with --validate_only to test PDB download and chain parsing without Boltz."
+        )
 
     rows = []
     failures = []
     for e in entries:
         try:
-            r = process_entry(
-                entry=e,
-                pdb_dir=pdb_dir,
-                workdir=workdir,
-                boltz_binary=args.boltz_binary,
-                boltz_predict_extra_args=args.boltz_predict_extra_args,
-                accelerator=args.accelerator,
-                sampling_steps=args.sampling_steps,
-                diffusion_samples=args.diffusion_samples,
-                recycling_steps=args.recycling_steps,
-            )
-            rows.append(
-                {
-                    "pdb_id": e.pdb_id,
-                    "input_chain_1_binder": e.chain_1,
-                    "input_chain_2_target": e.chain_2,
-                    "source_pdb": str(r.pdb_path),
-                    "refold_cif": str(r.refold_cif),
-                    "confidence_json": str(r.confidence_json),
-                    "design_iiptm": r.design_iiptm,
-                    "design_ptm": r.design_ptm,
-                    "min_design_to_target_pae": r.min_design_to_target_pae,
-                    "neg_min_design_to_target_pae": r.neg_min_design_to_target_pae,
-                    "delta_sasa_refolded": r.delta_sasa_refolded,
-                    "design_sasa_unbound_refolded": r.design_sasa_unbound_refolded,
-                    "design_sasa_bound_refolded": r.design_sasa_bound_refolded,
-                    "plip_hbonds_refolded": r.plip_hbonds_refolded,
-                    "plip_saltbridge_refolded": r.plip_saltbridge_refolded,
-                }
-            )
+            if args.validate_only:
+                pdb_path = download_pdb(e.pdb_id, pdb_dir)
+                structure = parse_structure(pdb_path)
+                binder_seq = extract_chain_sequence(structure, e.chain_1)
+                target_seq = extract_chain_sequence(structure, e.chain_2)
+                rows.append(
+                    {
+                        "pdb_id": e.pdb_id,
+                        "input_chain_1_binder": e.chain_1,
+                        "input_chain_2_target": e.chain_2,
+                        "source_pdb": str(pdb_path),
+                        "binder_length": len(binder_seq),
+                        "target_length": len(target_seq),
+                    }
+                )
+            else:
+                r = process_entry(
+                    entry=e,
+                    pdb_dir=pdb_dir,
+                    workdir=workdir,
+                    boltz_binary=args.boltz_binary,
+                    boltz_predict_extra_args=args.boltz_predict_extra_args,
+                    accelerator=args.accelerator,
+                    sampling_steps=args.sampling_steps,
+                    diffusion_samples=args.diffusion_samples,
+                    recycling_steps=args.recycling_steps,
+                )
+                rows.append(
+                    {
+                        "pdb_id": e.pdb_id,
+                        "input_chain_1_binder": e.chain_1,
+                        "input_chain_2_target": e.chain_2,
+                        "source_pdb": str(r.pdb_path),
+                        "refold_cif": str(r.refold_cif),
+                        "confidence_json": str(r.confidence_json),
+                        "design_iiptm": r.design_iiptm,
+                        "design_ptm": r.design_ptm,
+                        "min_design_to_target_pae": r.min_design_to_target_pae,
+                        "neg_min_design_to_target_pae": r.neg_min_design_to_target_pae,
+                        "delta_sasa_refolded": r.delta_sasa_refolded,
+                        "design_sasa_unbound_refolded": r.design_sasa_unbound_refolded,
+                        "design_sasa_bound_refolded": r.design_sasa_bound_refolded,
+                        "plip_hbonds_refolded": r.plip_hbonds_refolded,
+                        "plip_saltbridge_refolded": r.plip_saltbridge_refolded,
+                    }
+                )
         except Exception as exc:
             failures.append({"pdb_id": e.pdb_id, "chain_1": e.chain_1, "chain_2": e.chain_2, "error": str(exc)})
 
     if not rows:
         raise RuntimeError(f"No successful entries. Failures: {failures}")
 
-    ranked = rank_like_boltzgen(pd.DataFrame(rows))
+    ranked = pd.DataFrame(rows) if args.validate_only else rank_like_boltzgen(pd.DataFrame(rows))
     Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
     ranked.to_csv(args.output_csv, index=False)
 
